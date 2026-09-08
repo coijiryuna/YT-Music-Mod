@@ -1,0 +1,14 @@
+frontend/
+frontend/node_modules/
+node_modules/
+rfmusic/
+.vscode/
+.vercel/
+.env
+.env.*
+*.log
+.DS_Store
+.cache/
+.arena/
+key.md
+SKILL.md
