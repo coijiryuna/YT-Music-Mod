@@ -1,5 +1,5 @@
-frontend/
-frontend/node_modules/
+frontend-vue/
+frontend-vue/node_modules/
 node_modules/
 rfmusic/
 .vscode/
