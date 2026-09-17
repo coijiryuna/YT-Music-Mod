@@ -1,8 +1,101 @@
 /* Rifa Music - backend proxy for YouTube Music InnerTube API + LRCLIB lyrics */
+process.env.YTDL_NO_UPDATE = "true";
+
 const express = require("express");
 const path = require("path");
 const { Agent, fetch: undiciFetch } = require("undici");
+const { DatabaseSync } = require("node:sqlite");
 
+const { exec } = require("child_process");
+const ffmpeg = require("fluent-ffmpeg");
+const ytdl = require("@distube/ytdl-core");
+
+const util = require("util");
+const execPromise = util.promisify(exec);
+
+// Inisialisasi Database SQLite Cache untuk Stream URLs
+const dbPath = path.join(__dirname, "stream_cache.db");
+const db = new DatabaseSync(dbPath);
+
+// Buat tabel cache jika belum ada
+db.exec(`
+  CREATE TABLE IF NOT EXISTS stream_cache (
+    video_id TEXT NOT NULL,
+    quality TEXT NOT NULL,
+    video_url TEXT NOT NULL,
+    audio_url TEXT NOT NULL,
+    expire_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (video_id, quality)
+  )
+`);
+
+// Prepared statements untuk efisiensi maksimal
+const stmtGetCache = db.prepare(`
+  SELECT video_url, audio_url, expire_at
+  FROM stream_cache
+  WHERE video_id = ? AND quality = ?
+`);
+
+const stmtSetCache = db.prepare(`
+  INSERT INTO stream_cache (video_id, quality, video_url, audio_url, expire_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(video_id, quality) DO UPDATE SET
+    video_url = excluded.video_url,
+    audio_url = excluded.audio_url,
+    expire_at = excluded.expire_at,
+    updated_at = excluded.updated_at
+`);
+
+function extractExpireTimestamp(url) {
+  if (!url) return Math.floor(Date.now() / 1000) + 18000;
+  try {
+    const parsed = new URL(url);
+    const exp = parsed.searchParams.get("expire");
+    if (exp) return parseInt(exp, 10);
+  } catch {}
+  const match = url.match(/[?&]expire=(\d+)/);
+  if (match) return parseInt(match[1], 10);
+  // Default fallback 5 jam (18000 detik) jika tidak ditemukan
+  return Math.floor(Date.now() / 1000) + 18000;
+}
+
+function getCachedStreams(videoId, quality) {
+  try {
+    const row = stmtGetCache.get(videoId, quality);
+    if (!row) return null;
+
+    const now = Math.floor(Date.now() / 1000);
+    // Beri buffer 5 menit (300 detik) sebelum masa aktif berakhir
+    if (row.expire_at > now + 300) {
+      return {
+        videoUrl: row.video_url,
+        audioUrl: row.audio_url,
+        expireAt: row.expire_at,
+      };
+    }
+  } catch (err) {
+    console.error("[Cache Read Error]:", err.message);
+  }
+  return null;
+}
+
+function saveCachedStreams(videoId, quality, videoUrl, audioUrl) {
+  try {
+    const expireVideo = extractExpireTimestamp(videoUrl);
+    const expireAudio = extractExpireTimestamp(audioUrl);
+    // Gunakan expire yang paling cepat habis antara video dan audio
+    const minExpire = Math.min(expireVideo, expireAudio);
+    const now = Math.floor(Date.now() / 1000);
+
+    stmtSetCache.run(videoId, quality, videoUrl, audioUrl, minExpire, now);
+    console.log(
+      `[Cache Saved] videoId: ${videoId} (${quality}), expires in ~${Math.round((minExpire - now) / 60)} minutes`,
+    );
+  } catch (err) {
+    console.error("[Cache Save Error]:", err.message);
+  }
+}
 // Agent khusus untuk mengabaikan error sertifikat SSL yang expired
 const insecureAgent = new Agent({
   connect: {
@@ -11,7 +104,7 @@ const insecureAgent = new Agent({
 });
 
 const app = express();
-let currentMode = "audio"; // Default mode
+let currentMode = "video"; // Default mode
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -662,26 +755,12 @@ app.get("/api/browse", async (req, res) => {
   }
 });
 
-/* ---------------- music download via third-party converter (loader.to) ----------------
-   Highest quality MP3 (320kbps). Our server orchestrates the conversion job:
-   start -> poll progress -> hand the final direct file URL to the browser.
-   The user never sees or visits the third-party site — the file just downloads. */
-const LOADER_API = "https://loader.to/ajax/download.php";
+/* ---------------- music download via third-party converter ---------------- */
 const DL_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 const FALLBACK_CACHE_TTL_MS = 10 * 60 * 1000;
 const fallbackJobCache = new Map();
 const streamFallbackCache = new Map();
-let youtubeIpBlockedUntil = 0;
-const YOUTUBE_BLOCK_TTL_MS = 15 * 60 * 1000;
-
-function isYoutubeIpBlocked() {
-  return Date.now() < youtubeIpBlockedUntil;
-}
-
-function markYoutubeIpBlocked() {
-  youtubeIpBlockedUntil = Date.now() + YOUTUBE_BLOCK_TTL_MS;
-}
 
 function getFallbackCache(videoId) {
   const entry = fallbackJobCache.get(videoId);
@@ -719,7 +798,34 @@ function clearStreamFallback(videoId) {
   streamFallbackCache.delete(videoId);
 }
 
-/* start a conversion job: returns { jobId, progressUrl } */
+/* Helper aman untuk mengurai JSON tanpa membuat server crash */
+async function fetchSafeJson(url, options = {}) {
+  const r = await undiciFetch(url, {
+    ...options,
+    dispatcher: insecureAgent,
+  });
+
+  const text = await r.text();
+
+  if (!r.ok) {
+    throw new Error(`HTTP ${r.status}: ${text.slice(0, 100)}`);
+  }
+
+  // Cek apakah balasan diawali tag HTML (<!DOCTYPE atau <html)
+  if (text.trim().startsWith("<")) {
+    throw new Error(
+      "Layanan konverter mengembalikan HTML (Kemungkinan diblokir/Cloudflare), bukan JSON.",
+    );
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error("Gagal menguraikan respons dari konverter (Invalid JSON).");
+  }
+}
+
+/* API Start endpoint */
 app.get("/api/download-start", async (req, res) => {
   const videoId = String(req.query.videoId || "");
   if (!/^[\w-]{6,20}$/.test(videoId))
@@ -735,13 +841,15 @@ app.get("/api/download-start", async (req, res) => {
       });
     }
 
-    const u = `${LOADER_API}?format=mp3&url=${encodeURIComponent("https://www.youtube.com/watch?v=" + videoId)}`;
-    const r = await fetch(u, {
-      headers: { "User-Agent": DL_UA, Referer: "https://loader.to/" },
+    const targetUrl = `https://savenow.to/ajax/download.php?format=mp3&url=${encodeURIComponent("https://www.youtube.com/watch?v=" + videoId)}`;
+    const d = await fetchSafeJson(targetUrl, {
+      headers: {
+        "User-Agent": DL_UA,
+        Referer: "https://savenow.to/",
+      },
     });
-    if (!r.ok) throw new Error(`start -> ${r.status}`);
-    const d = await r.json();
-    if (!d.success || !d.id) throw new Error("converter refused this song");
+
+    if (!d.success || !d.id) throw new Error("Konverter menolak lagu ini");
 
     setFallbackCache(videoId, {
       jobId: d.id,
@@ -760,24 +868,7 @@ app.get("/api/download-start", async (req, res) => {
   }
 });
 
-/* download android apk */
-app.get("/download-apk", (_req, res) => {
-  const fs = require("fs");
-  const publicApk = path.join(__dirname, "public", "RifaMusic.apk");
-  const fePublicApk = path.join(__dirname, "frontend-vue", "public", "RifaMusic.apk");
-  const flutterApk = path.join(__dirname, "rfmusic", "build", "app", "outputs", "flutter-apk", "app-arm64-v8a-release.apk");
-
-  if (fs.existsSync(publicApk)) {
-    res.download(publicApk, "RifaMusic.apk");
-  } else if (fs.existsSync(fePublicApk)) {
-    res.download(fePublicApk, "RifaMusic.apk");
-  } else if (fs.existsSync(flutterApk)) {
-    res.download(flutterApk, "RifaMusic.apk");
-  } else {
-    res.status(404).json({ error: "APK file not found" });
-  }
-});
-
+/* API Progress polling endpoint */
 app.get("/api/download-progress", async (req, res) => {
   const purl = String(req.query.progressUrl || "");
   try {
@@ -790,12 +881,15 @@ app.get("/api/download-progress", async (req, res) => {
       host.endsWith(".loader.to") ||
       host.endsWith(".savenow.to") ||
       host.endsWith(".affadaffa.com");
+
     if (!okHost) {
       return res.status(400).json({ error: "bad progress url" });
     }
-    const r = await fetch(purl, { headers: { "User-Agent": DL_UA } });
-    if (!r.ok) throw new Error(`progress -> ${r.status}`);
-    const d = await r.json();
+
+    const d = await fetchSafeJson(purl, {
+      headers: { "User-Agent": DL_UA },
+    });
+
     res.json({
       progress: d.progress || 0,
       done: !!d.success && !!d.download_url,
@@ -809,80 +903,44 @@ app.get("/api/download-progress", async (req, res) => {
   }
 });
 
+/* Stream fallback menggunakan yt-dlp lokal */
 async function resolveStreamFallback(videoId, quality) {
+  // Cek cache internal aplikasi Anda
   const cached = getStreamFallback(videoId);
   if (cached?.url) return cached;
   if (cached?.pending) return cached.pending;
 
-  const pending = (async () => {
-    let progressUrl = null;
-    const cachedJob = getFallbackCache(videoId);
+  const pending = new Promise((resolve, reject) => {
+    // Perintah yt-dlp untuk mengambil URL audio terbaik
+    const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const command = `yt-dlp -g -f "ba/ba*" "${youtubeUrl}"`;
 
-    // 1. Dapatkan Progress URL (dari cache atau eksekusi awal)
-    if (cachedJob?.progressUrl) {
-      progressUrl = cachedJob.progressUrl;
-    } else {
-      const u = `${LOADER_API}?format=mp3&url=${encodeURIComponent("https://www.youtube.com/watch?v=" + videoId)}`;
-
-      // Menggunakan undiciFetch dengan dispatcher insecureAgent untuk bypass CERT_HAS_EXPIRED
-      const r = await undiciFetch(u, {
-        headers: { "User-Agent": DL_UA, Referer: "https://loader.to/" },
-        dispatcher: insecureAgent,
-      });
-
-      if (!r.ok) throw new Error(`start -> ${r.status}`);
-      const d = await r.json();
-      if (!d.success || !d.id) throw new Error("converter refused this song");
-
-      progressUrl = d.progress_url;
-      setFallbackCache(videoId, {
-        jobId: d.id,
-        progressUrl: d.progress_url,
-        title: d.title || null,
-      });
-    }
-
-    if (!progressUrl) {
-      throw new Error("Missing fallback progress url");
-    }
-
-    // 2. Polling progress status hingga download_url siap
-    let fallbackUrl = null;
-    for (let attempt = 0; attempt < 15; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-
-      const r = await undiciFetch(progressUrl, {
-        headers: { "User-Agent": DL_UA },
-        dispatcher: insecureAgent,
-      });
-
-      if (r.ok) {
-        const status = await r.json();
-        if (status.success && status.download_url) {
-          fallbackUrl = status.download_url;
-          break;
-        }
+    exec(command, { timeout: 15000 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error("[yt-dlp Exec Error]:", stderr || error.message);
+        return reject(new Error("Gagal mengekstrak audio via yt-dlp lokal"));
       }
-    }
 
-    if (!fallbackUrl) {
-      throw new Error("Fallback converter timed out");
-    }
+      // Ambil URL direct stream pertama yang dihasilkan yt-dlp
+      const directUrl = stdout.trim().split("\n")[0];
 
-    const payload = {
-      url: fallbackUrl,
-      mimeType: "audio/mpeg",
-      bitrate: 320000,
-      quality,
-      format: "mp3",
-    };
+      if (!directUrl || !directUrl.startsWith("http")) {
+        return reject(new Error("URL audio tidak valid dari yt-dlp"));
+      }
 
-    // Simpan hasil ke cache stream
-    setStreamFallback(videoId, payload);
-    clearFallbackCache(videoId);
+      const payload = {
+        url: directUrl,
+        mimeType: "audio/webm",
+        quality: quality || "medium",
+        format: "webm",
+        source: "local-ytdlp",
+      };
 
-    return payload;
-  })();
+      // Simpan hasil ke cache
+      setStreamFallback(videoId, payload);
+      resolve(payload);
+    });
+  });
 
   setStreamFallback(videoId, { pending });
 
@@ -950,6 +1008,173 @@ app.get(["/api/stream", "/api/resolve"], async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+async function getFormatsFromYtdlp(videoId, quality) {
+  // 1. Cek database cache terlebih dahulu apakah URL masih aktif
+  const cached = getCachedStreams(videoId, quality);
+  if (cached) {
+    console.log(
+      `[Cache HIT] Using cached streams for videoId: ${videoId}, quality: ${quality} (valid until ${new Date(cached.expireAt * 1000).toLocaleTimeString()})`,
+    );
+    return {
+      videoUrl: cached.videoUrl,
+      audioUrl: cached.audioUrl,
+      cached: true,
+      expireAt: cached.expireAt,
+    };
+  }
+
+  console.log(
+    `[Cache MISS / Expired] Starting yt-dlp extraction for videoId: ${videoId}, quality: ${quality}`,
+  );
+  let formatSelector = "bestvideo[height<=720]+bestaudio/best";
+  if (quality === "1080p")
+    formatSelector = "bestvideo[height<=1080]+bestaudio/best";
+  if (quality === "360p")
+    formatSelector = "bestvideo[height<=360]+bestaudio/best";
+
+  // Added -4 to force IPv4 connection and avoid IPv6 DNS issues
+  const cmd = `yt-dlp -4 --no-playlist -g -f "${formatSelector}" "https://www.youtube.com/watch?v=${videoId}"`;
+  console.log(`[yt-dlp] Executing: ${cmd}`);
+
+  const { stdout } = await execPromise(cmd);
+  const urls = stdout.trim().split("\n");
+
+  console.log(`[yt-dlp] Extracted ${urls.length} URL(s)`);
+  const videoUrl = urls[0];
+  const audioUrl = urls[1] || urls[0];
+
+  console.log(`[yt-dlp] Video Direct URL: ${videoUrl}`);
+  console.log(`[yt-dlp] Audio Direct URL: ${audioUrl}`);
+
+  // Simpan hasil ekstraksi baru ke database cache SQLite
+  if (videoUrl && audioUrl) {
+    saveCachedStreams(videoId, quality, videoUrl, audioUrl);
+  }
+
+  return {
+    videoUrl: videoUrl,
+    audioUrl: audioUrl,
+    cached: false,
+    expireAt: Math.min(
+      extractExpireTimestamp(videoUrl),
+      extractExpireTimestamp(audioUrl),
+    ),
+  };
+}
+
+app.get("/api/stream-video", async (req, res) => {
+  const videoId = req.query.id;
+  const quality = req.query.quality || "720p";
+
+  if (!videoId) return res.status(400).send("Video ID is required");
+
+  try {
+    const { videoUrl, audioUrl } = await getFormatsFromYtdlp(videoId, quality);
+    if (!videoUrl)
+      return res.status(500).send("Failed to extract video stream");
+
+    // Change Content-Type to MP4
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Connection", "keep-alive");
+
+    const command = ffmpeg();
+    const inputOpts = [
+      "-reconnect 1",
+      "-reconnect_streamed 1",
+      "-reconnect_delay_max 5",
+      "-headers",
+      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\n",
+    ];
+
+    command.input(videoUrl).inputOptions(inputOpts);
+    if (audioUrl && audioUrl !== videoUrl) {
+      command.input(audioUrl).inputOptions(inputOpts);
+    }
+
+    command
+      .outputOptions([
+        "-c:v copy",
+        "-c:a aac",
+        "-b:a 128k",
+        "-ac 2",
+        "-ar 44100",
+        // PENTING: Flag untuk Fragmented MP4 agar bisa di-stream langsung
+        "-movflags frag_keyframe+empty_moov+default_base_moof+faststart",
+        "-preset ultrafast",
+        "-shortest",
+      ])
+      .format("mp4");
+
+    const killFFmpeg = () => {
+      try {
+        command.unpipe(res);
+        command.kill("SIGKILL");
+      } catch (e) {}
+    };
+
+    req.on("close", killFFmpeg);
+    res.on("error", killFFmpeg);
+
+    command.on("error", (err) => {
+      const ignoredErrors = ["SIGKILL", "Output stream closed", "write EPIPE"];
+      if (!ignoredErrors.some((e) => err.message?.includes(e))) {
+        console.error("[FFmpeg Error]:", err.message);
+      }
+    });
+
+    command.pipe(res, { end: true });
+  } catch (err) {
+    console.error("Error Streaming Video:", err);
+    if (!res.headersSent) res.status(500).send("Streaming Error");
+  }
+});
+
+app.get("/api/get-stream-urls", async (req, res) => {
+  const videoId = req.query.id;
+  const quality = req.query.quality || "720p";
+
+  if (!videoId) {
+    return res.status(400).json({ error: "Video ID is required" });
+  }
+
+  try {
+    // Ambil direct URL video dan audio (otomatis cek cache DB atau yt-dlp jika expire)
+    const { videoUrl, audioUrl, cached, expireAt } = await getFormatsFromYtdlp(
+      videoId,
+      quality,
+    );
+
+    if (!videoUrl || !audioUrl) {
+      return res.status(500).json({ error: "Failed to extract streams" });
+    }
+
+    // Kembalikan JSON berisi kedua URL tersebut beserta metadata cache
+    return res.json({
+      success: true,
+      videoUrl: videoUrl,
+      audioUrl: audioUrl,
+      cached: !!cached,
+      expireAt: expireAt || null,
+    });
+  } catch (err) {
+    console.error("Error extracting URLs:", err);
+    return res.status(500).json({ error: "Extractor error" });
+  }
+});
+
+app.get("/download-apk", (_req, res) => {
+  const fs = require("fs");
+  const publicApk = path.join(__dirname, "public", "RifaMusic.apk");
+
+  if (fs.existsSync(publicApk)) {
+    res.download(publicApk, "RifaMusic.apk");
+  } else {
+    res.status(404).json({ error: "APK file not found" });
+  }
+});
+
 /* ---------------- lyrics: multi-strategy matcher ----------------
    LRCLIB (synced) -> LRCLIB fuzzy -> YouTube Music (plain)
    -> NetEase (synced/plain) -> lyrics.ovh (plain). */

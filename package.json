@@ -11,7 +11,9 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
     "express": "^5.2.1",
-    "undici": "^8.10.2"
+    "fluent-ffmpeg": "^2.1.3",
+    "undici": "^8.10.0"
   }
 }
